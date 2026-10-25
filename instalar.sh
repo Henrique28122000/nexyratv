@@ -1,12 +1,13 @@
 
+cat > /root/instalar-painel.sh <<'INSTALLER'
 #!/usr/bin/env bash
-
 set -Eeuo pipefail
+umask 027
 
 # ==========================================================
-# INSTALADOR AUTOMATICO
+# NEXYRA - INSTALADOR PHP + SQLITE + NGINX + SSL
 # Ubuntu 22.04 / 24.04
-# Nginx + PHP-FPM + SQLite + SSL Let's Encrypt
+# Preserva backups, corrige dominio.txt e testa SQLite real.
 # ==========================================================
 
 ZIP_URL="https://www.dropbox.com/scl/fi/6b7b0iyky4bffle14xo49/script_completo.zip?rlkey=2t3a3c9z41xz2138ru1pjipjy&st=a1melg5s&dl=1"
@@ -17,465 +18,439 @@ EXTRACT_DIR="$TMP_DIR/extracao"
 PUBLISH_DIR="$TMP_DIR/publicacao"
 
 INSTALL_DIR="/var/www/painel"
+BACKUP_ROOT="/var/backups/instalador-site"
 NGINX_SITE="/etc/nginx/sites-available/painel"
 NGINX_LINK="/etc/nginx/sites-enabled/painel"
 
-BACKUP_ROOT="/var/backups/instalador-site"
 PHP_VERSION=""
 PHP_SOCKET=""
 DOMAIN=""
 BACKUP_DIR=""
 NGINX_BACKUP=""
+OLD_SITE=""
 
-# ----------------------------------------------------------
-# CORES E FUNCOES
-# ----------------------------------------------------------
+info()    { printf '\033[0;34m[INFO]\033[0m %s\n' "$*"; }
+ok()      { printf '\033[0;32m[OK]\033[0m %s\n' "$*"; }
+warn()    { printf '\033[1;33m[AVISO]\033[0m %s\n' "$*"; }
+die()     { printf '\033[0;31m[ERRO]\033[0m %s\n' "$*" >&2; exit 1; }
 
-VERDE='\033[0;32m'
-AMARELO='\033[1;33m'
-VERMELHO='\033[0;31m'
-AZUL='\033[0;34m'
-RESET='\033[0m'
+trap 'rc=$?; echo "[ERRO] Falha na linha $LINENO (codigo $rc)." >&2; exit "$rc"' ERR
 
-info()    { echo -e "${AZUL}[INFO]${RESET} $*"; }
-sucesso() { echo -e "${VERDE}[OK]${RESET} $*"; }
-aviso()   { echo -e "${AMARELO}[AVISO]${RESET} $*"; }
-erro()    { echo -e "${VERMELHO}[ERRO]${RESET} $*" >&2; }
+[[ "$EUID" -eq 0 ]] || die "Execute como root: bash /root/instalar-painel.sh"
+[[ -f /etc/os-release ]] || die "Sistema operacional nao identificado."
 
-trap 'rc=$?; erro "Falha na linha $LINENO (codigo $rc)."; erro "Confira as mensagens acima antes de executar novamente."; exit "$rc"' ERR
-
-# ----------------------------------------------------------
-# 1. VERIFICAR SISTEMA
-# ----------------------------------------------------------
-
-echo
-echo "=========================================================="
-echo "       INSTALADOR PHP + SQLITE + NGINX"
-echo "=========================================================="
-echo
-echo "Diretorio do site: $INSTALL_DIR"
-echo "Arquivo ZIP:      $ZIP_FILE"
-echo
-
-if [[ "$EUID" -ne 0 ]]; then
-    erro "Execute como root: sudo bash instalar.sh"
-    exit 1
-fi
-
-if [[ ! -f /etc/os-release ]]; then
-    erro "Arquivo /etc/os-release nao encontrado."
-    exit 1
-fi
-
-# shellcheck disable=SC1091
-source /etc/os-release
-
-if [[ "${ID:-}" != "ubuntu" ||
-      ( "${VERSION_ID:-}" != "22.04" && "${VERSION_ID:-}" != "24.04" ) ]]; then
-    erro "Este instalador aceita Ubuntu 22.04 ou 24.04."
-    erro "Sistema detectado: ${PRETTY_NAME:-desconhecido}"
-    exit 1
-fi
-
-sucesso "Sistema: $PRETTY_NAME"
+. /etc/os-release
+[[ "${ID:-}" == ubuntu ]] || die "Este instalador exige Ubuntu."
+[[ "${VERSION_ID:-}" == "22.04" || "${VERSION_ID:-}" == "24.04" ]] ||
+    die "Use Ubuntu 22.04 ou 24.04."
 
 mkdir -p "$TMP_DIR" "$BACKUP_ROOT"
 
-# ----------------------------------------------------------
-# 2. INSTALAR PHP, SQLITE, NGINX E CERTBOT
-# ----------------------------------------------------------
-
 echo
-echo "[2/8] Instalando dependencias..."
+echo "=========================================================="
+echo "       INSTALADOR NEXYRA - PHP / SQLITE / NGINX"
+echo "=========================================================="
+echo "Sistema: $PRETTY_NAME"
+echo "Site:    $INSTALL_DIR"
+echo "ZIP:     $ZIP_FILE"
+echo
 
+# ----------------------------------------------------------
+# 1. DEPENDENCIAS
+# ----------------------------------------------------------
+
+info "Atualizando pacotes e instalando dependencias..."
 export DEBIAN_FRONTEND=noninteractive
 
 apt-get update
-
 apt-get install -y \
-    ca-certificates \
-    curl \
-    wget \
-    unzip \
-    zip \
-    nginx \
-    python3 \
-    python3-pip \
-    python3-venv \
-    php-fpm \
-    php-cli \
-    php-common \
-    php-sqlite3 \
-    php-curl \
-    php-gd \
-    php-mbstring \
-    php-xml \
-    php-zip \
-    php-intl \
-    php-bcmath \
-    certbot \
-    python3-certbot-nginx
+    ca-certificates curl wget unzip zip \
+    nginx python3 python3-pip python3-venv \
+    php-fpm php-cli php-common \
+    php-sqlite3 php-curl php-gd php-mbstring \
+    php-xml php-zip php-intl php-bcmath \
+    certbot python3-certbot-nginx
 
 PHP_VERSION="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
 PHP_SOCKET="/run/php/php${PHP_VERSION}-fpm.sock"
 
-sucesso "PHP instalado: $PHP_VERSION"
-
-# ----------------------------------------------------------
-# 3. VERIFICAR SQLITE NO PHP
-# ----------------------------------------------------------
-
-echo
-echo "[3/8] Verificando suporte ao SQLite..."
-
-if ! php -r '
-    if (!extension_loaded("pdo_sqlite")) {
-        fwrite(STDERR, "Extensao pdo_sqlite nao carregada.\n");
-        exit(1);
-    }
-    if (!extension_loaded("sqlite3")) {
-        fwrite(STDERR, "Extensao sqlite3 nao carregada.\n");
-        exit(1);
-    }
-    $pdo = new PDO("sqlite::memory:");
-    $pdo->query("SELECT 1");
-    echo "PDO SQLite e SQLite3 funcionando.\n";
-'; then
-    erro "O PHP CLI nao conseguiu inicializar o SQLite."
-    erro "Verifique a instalacao do pacote php-sqlite3."
-    exit 1
-fi
-
-# Confere se as configuracoes do FPM incluem os modulos.
-FPM_CONF_DIR="/etc/php/${PHP_VERSION}/fpm/conf.d"
-
-if [[ ! -e "$FPM_CONF_DIR/20-pdo_sqlite.ini" ||
-      ! -e "$FPM_CONF_DIR/20-sqlite3.ini" ]]; then
-    aviso "Os arquivos de configuracao SQLite do PHP-FPM nao foram localizados."
-    aviso "Tentando habilitar os modulos no PHP-FPM."
-
-    phpenmod -v "$PHP_VERSION" -s fpm pdo_sqlite sqlite3 || true
-fi
+phpenmod -v "$PHP_VERSION" -s cli pdo_sqlite sqlite3
+phpenmod -v "$PHP_VERSION" -s fpm pdo_sqlite sqlite3
 
 systemctl enable "php${PHP_VERSION}-fpm"
 systemctl restart "php${PHP_VERSION}-fpm"
 
-if [[ ! -S "$PHP_SOCKET" ]]; then
-    erro "Socket PHP-FPM nao encontrado: $PHP_SOCKET"
-    exit 1
-fi
+php -r '
+if (!extension_loaded("pdo_sqlite") || !extension_loaded("sqlite3")) {
+    fwrite(STDERR, "Extensoes SQLite ausentes no PHP CLI.\n");
+    exit(1);
+}
+$pdo = new PDO("sqlite::memory:");
+$pdo->query("SELECT 1");
+echo "PDO SQLite e SQLite3 funcionando no CLI.\n";
+' || die "SQLite nao funciona no PHP CLI."
 
-sucesso "PHP-FPM iniciado. O teste do SQLite no CLI passou."
+[[ -S "$PHP_SOCKET" ]] || die "Socket PHP-FPM nao encontrado: $PHP_SOCKET"
+ok "PHP $PHP_VERSION, SQLite e PHP-FPM instalados."
 
 # ----------------------------------------------------------
-# 4. REUTILIZAR OU BAIXAR O ZIP
+# 2. BAIXAR OU REUTILIZAR ZIP
 # ----------------------------------------------------------
 
-echo
-echo "[4/8] Verificando o ZIP..."
-
-REUTILIZAR_ZIP=0
-
-if [[ -s "$ZIP_FILE" ]] &&
-   unzip -tq "$ZIP_FILE" >/dev/null 2>&1; then
-
+if [[ -s "$ZIP_FILE" ]] && unzip -tq "$ZIP_FILE" >/dev/null 2>&1; then
     echo
-    sucesso "ZIP valido encontrado: $ZIP_FILE"
-    echo "1) Reutilizar o ZIP existente"
+    echo "Foi encontrado um ZIP valido:"
+    echo "$ZIP_FILE"
+    echo "1) Reutilizar ZIP existente"
     echo "2) Baixar novamente"
     echo "3) Cancelar"
-    echo
+    read -r -p "Escolha [1/2/3]: " CHOICE
 
-    while true; do
-        read -r -p "Escolha [1/2/3]: " OPCAO
+    case "$CHOICE" in
+        1) info "Reutilizando ZIP existente." ;;
+        2) rm -f "${ZIP_FILE}.download" ;;
+        3) echo "Cancelado; ZIP preservado."; exit 0 ;;
+        *) die "Opcao invalida." ;;
+    esac
 
-        case "$OPCAO" in
-            1)
-                REUTILIZAR_ZIP=1
-                break
-                ;;
-            2)
-                REUTILIZAR_ZIP=0
-                break
-                ;;
-            3)
-                echo "Instalacao cancelada. ZIP preservado."
-                exit 0
-                ;;
-            *)
-                aviso "Escolha 1, 2 ou 3."
-                ;;
-        esac
-    done
+    [[ "$CHOICE" == "1" ]] || DOWNLOAD=1
 else
-    aviso "Nenhum ZIP valido encontrado."
+    DOWNLOAD=1
 fi
 
-if [[ "$REUTILIZAR_ZIP" -eq 0 ]]; then
-    ARQUIVO_NOVO="${ZIP_FILE}.download"
-    rm -f "$ARQUIVO_NOVO"
+if [[ "${DOWNLOAD:-0}" == "1" ]]; then
+    info "Baixando pacote do projeto..."
+    curl --fail --location --show-error \
+        --retry 3 --retry-delay 2 --connect-timeout 30 \
+        --output "${ZIP_FILE}.download" "$ZIP_URL"
 
-    info "Baixando o arquivo do site..."
+    unzip -tq "${ZIP_FILE}.download" >/dev/null ||
+        die "O ZIP baixado e invalido. ZIP anterior preservado."
 
-    curl \
-        --fail \
-        --location \
-        --show-error \
-        --retry 3 \
-        --retry-delay 2 \
-        --connect-timeout 30 \
-        --output "$ARQUIVO_NOVO" \
-        "$ZIP_URL"
-
-    if [[ ! -s "$ARQUIVO_NOVO" ]] ||
-       ! unzip -tq "$ARQUIVO_NOVO" >/dev/null 2>&1; then
-        rm -f "$ARQUIVO_NOVO"
-        erro "Download invalido. O ZIP anterior foi preservado."
-        exit 1
-    fi
-
-    mv -f "$ARQUIVO_NOVO" "$ZIP_FILE"
-    sucesso "Download concluido e ZIP validado."
-else
-    sucesso "Reutilizando o ZIP existente."
+    mv -f "${ZIP_FILE}.download" "$ZIP_FILE"
+    ok "ZIP baixado e validado."
 fi
 
 # ----------------------------------------------------------
-# 5. EXTRAIR, LOCALIZAR O SITE E SOLICITAR DOMINIO
+# 3. EXTRAIR E LOCALIZAR SITE
 # ----------------------------------------------------------
 
-echo
-echo "[5/8] Extraindo e verificando os arquivos..."
-
+info "Extraindo arquivos..."
 rm -rf "$EXTRACT_DIR"
 mkdir -p "$EXTRACT_DIR"
-
 unzip -oq "$ZIP_FILE" -d "$EXTRACT_DIR"
 
-mapfile -d '' ARQUIVOS_DOMINIO < <(
-    find "$EXTRACT_DIR" -type f -iname "dominio.txt" -print0
+mapfile -d '' DOMAIN_FILES < <(
+    find "$EXTRACT_DIR" -type f -iname dominio.txt -print0
 )
 
-if [[ "${#ARQUIVOS_DOMINIO[@]}" -ne 1 ]]; then
-    erro "O ZIP precisa conter exatamente um arquivo dominio.txt."
-    erro "Quantidade encontrada: ${#ARQUIVOS_DOMINIO[@]}"
-    exit 1
-fi
+[[ "${#DOMAIN_FILES[@]}" -eq 1 ]] ||
+    die "O ZIP deve conter exatamente um dominio.txt; encontrados: ${#DOMAIN_FILES[@]}."
 
-PASTA_SITE="$(dirname "${ARQUIVOS_DOMINIO[0]}")"
+SITE_SOURCE="$(dirname "${DOMAIN_FILES[0]}")"
 
-if [[ ! -f "$PASTA_SITE/index.php" &&
-      ! -f "$PASTA_SITE/index.html" &&
-      ! -f "$PASTA_SITE/index.htm" ]]; then
-    erro "A pasta do dominio.txt nao contem index.php, index.html ou index.htm."
-    erro "Pasta: $PASTA_SITE"
-    exit 1
-fi
-
-sucesso "Arquivos do site localizados."
+[[ -f "$SITE_SOURCE/index.php" || -f "$SITE_SOURCE/index.html" ||
+   -f "$SITE_SOURCE/index.htm" ]] ||
+    die "A pasta do dominio.txt nao parece ser a raiz do site: $SITE_SOURCE"
 
 echo
-echo "Digite o dominio do painel."
-echo "Exemplo: painel.exemplo.com"
-echo "Somente letras e pontos."
-echo
+read -r -p "Dominio do painel (ex.: apk.exemplo.com.br): " DOMAIN
+DOMAIN="${DOMAIN,,}"
+DOMAIN="${DOMAIN%.}"
 
-while true; do
-    read -r -p "Dominio: " DOMAIN
-    DOMAIN="${DOMAIN,,}"
+# Aceita nomes DNS comuns, incluindo hifens e subdominios.
+[[ "$DOMAIN" =~ ^([a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$ ]] ||
+    die "Dominio invalido: $DOMAIN"
 
-    if [[ "$DOMAIN" =~ ^[a-z]+(\.[a-z]+)+$ ]]; then
-        break
-    fi
-
-    aviso "Dominio invalido. Tente novamente."
-done
-
-sucesso "Dominio: $DOMAIN"
+ok "Dominio informado: $DOMAIN"
 
 # ----------------------------------------------------------
-# 6. PREPARAR SITE, BACKUP E BANCO SQLITE
+# 4. BACKUP DO SITE E CONFIGURACAO NGINX
 # ----------------------------------------------------------
 
-echo
-echo "[6/8] Preparando a publicacao e o SQLite..."
-
-mkdir -p /etc/nginx/conf.d \
-         /etc/nginx/sites-available \
-         /etc/nginx/sites-enabled \
-         /etc/nginx/snippets
-
-# Se a configuracao principal do Nginx estiver ausente,
-# cria uma configuracao minima.
-if [[ ! -f /etc/nginx/nginx.conf ]]; then
-    aviso "nginx.conf nao encontrado. Criando configuracao."
-
-    cat > /etc/nginx/nginx.conf <<'NGINX_MAIN'
-user www-data;
-worker_processes auto;
-pid /run/nginx.pid;
-
-events {
-    worker_connections 1024;
-}
-
-http {
-    sendfile on;
-    tcp_nopush on;
-    tcp_nodelay on;
-    keepalive_timeout 65;
-    server_tokens off;
-
-    include /etc/nginx/mime.types;
-    default_type application/octet-stream;
-
-    access_log /var/log/nginx/access.log;
-    error_log /var/log/nginx/error.log;
-
-    include /etc/nginx/conf.d/*.conf;
-    include /etc/nginx/sites-enabled/*;
-}
-NGINX_MAIN
-fi
-
-if [[ ! -f /etc/nginx/snippets/fastcgi-php.conf ]]; then
-    cat > /etc/nginx/snippets/fastcgi-php.conf <<'FASTCGI_PHP'
-fastcgi_split_path_info ^(.+\.php)(/.+)$;
-try_files $fastcgi_script_name =404;
-set $path_info $fastcgi_path_info;
-fastcgi_param PATH_INFO $path_info;
-fastcgi_index index.php;
-include fastcgi.conf;
-FASTCGI_PHP
-fi
-
-# Backup completo do site anterior.
-if [[ -d "$INSTALL_DIR" ]]; then
-    BACKUP_DIR="$BACKUP_ROOT/painel-$(date +%Y%m%d-%H%M%S)"
-    mkdir -p "$BACKUP_DIR"
-
-    info "Fazendo backup completo do site anterior..."
-    cp -a "$INSTALL_DIR"/. "$BACKUP_DIR"/
-
-    sucesso "Backup criado: $BACKUP_DIR"
-fi
-
-# Backup da configuracao Nginx.
 if [[ -f "$NGINX_SITE" ]]; then
     NGINX_BACKUP="$BACKUP_ROOT/painel-nginx-$(date +%Y%m%d-%H%M%S).conf"
     cp -a "$NGINX_SITE" "$NGINX_BACKUP"
+    ok "Backup Nginx: $NGINX_BACKUP"
 fi
 
-# Preparar nova publicacao sem alterar o ZIP original.
+if [[ -d "$INSTALL_DIR" ]]; then
+    BACKUP_DIR="$BACKUP_ROOT/painel-$(date +%Y%m%d-%H%M%S)"
+    mkdir -p "$BACKUP_DIR"
+    info "Salvando site anterior em $BACKUP_DIR"
+    cp -a "$INSTALL_DIR"/. "$BACKUP_DIR"/
+    ok "Backup do site concluido."
+fi
+
+# ----------------------------------------------------------
+# 5. PREPARAR PUBLICACAO E PRESERVAR BANCOS
+# ----------------------------------------------------------
+
 rm -rf "$PUBLISH_DIR"
 mkdir -p "$PUBLISH_DIR"
+cp -a "$SITE_SOURCE"/. "$PUBLISH_DIR"/
 
-cp -a "$PASTA_SITE"/. "$PUBLISH_DIR"/
-
-# Preservar bancos SQLite antigos, se existirem no site anterior.
-# O banco anterior tem prioridade sobre uma copia do ZIP.
-if [[ -n "$BACKUP_DIR" && -d "$BACKUP_DIR" ]]; then
-    while IFS= read -r -d '' BANCO; do
-        RELATIVO="${BANCO#"$BACKUP_DIR"/}"
-        DESTINO="$PUBLISH_DIR/$RELATIVO"
-
-        mkdir -p "$(dirname "$DESTINO")"
-        cp -a "$BANCO" "$DESTINO"
-
-        # Copiar tambem os arquivos auxiliares SQLite encontrados.
-        for SUFIXO in "-wal" "-shm" "-journal"; do
-            if [[ -f "${BANCO}${SUFIXO}" ]]; then
-                cp -a "${BANCO}${SUFIXO}" "${DESTINO}${SUFIXO}"
-            fi
-        done
-
-        info "Banco SQLite preservado: $RELATIVO"
+# Se o site antigo tinha bancos SQLite, preserva-os no mesmo
+# caminho relativo quando o pacote novo ainda nao os possui.
+if [[ -n "$BACKUP_DIR" ]]; then
+    while IFS= read -r -d '' DB; do
+        REL="${DB#"$BACKUP_DIR"/}"
+        DEST="$PUBLISH_DIR/$REL"
+        if [[ ! -e "$DEST" ]]; then
+            mkdir -p "$(dirname "$DEST")"
+            cp -a "$DB" "$DEST"
+            for SUFFIX in -wal -shm -journal; do
+                [[ ! -f "${DB}${SUFFIX}" ]] ||
+                    cp -a "${DB}${SUFFIX}" "${DEST}${SUFFIX}"
+            done
+            info "Banco preservado: $REL"
+        fi
     done < <(
         find "$BACKUP_DIR" -type f \
-            \( -iname "*.sqlite" -o -iname "*.sqlite3" -o -iname "*.db" \) \
+            \( -iname '*.sqlite' -o -iname '*.sqlite3' -o -iname '*.db' \) \
             -print0
     )
 fi
 
-# Publicar sem apagar o diretorio antigo antes de existir backup.
-# O site antigo permanece disponivel no backup caso haja falha.
-if [[ -d "$INSTALL_DIR" ]]; then
-    mv "$INSTALL_DIR" "${INSTALL_DIR}.anterior-$(date +%Y%m%d-%H%M%S)"
+# Grava automaticamente o dominio escolhido na raiz publicada.
+printf '%s\n' "$DOMAIN" > "$PUBLISH_DIR/dominio.txt"
+
+# ----------------------------------------------------------
+# 6. CORRIGIR SQLITE_PATH CONHECIDO E MIGRAR BANCO
+# ----------------------------------------------------------
+
+TARGET_DB="$PUBLISH_DIR/.nexyra-p2p/panel.sqlite"
+mkdir -p "$(dirname "$TARGET_DB")"
+
+# Se a configuracao antiga usa /../.nexyra-p2p/panel.sqlite
+# ou /var/www/.nexyra-p2p/panel.sqlite, tenta preservar o banco.
+# O caminho padrao novo fica dentro da raiz do painel.
+OLD_DB_CANDIDATES=(
+    "$PUBLISH_DIR/.nexyra-p2p/panel.sqlite"
+    "$PUBLISH_DIR/nexyra-p2p/panel.sqlite"
+    "/var/www/.nexyra-p2p/panel.sqlite"
+    "/.nexyra-p2p/panel.sqlite"
+    "/home/binstream/.nexyra-p2p/panel.sqlite"
+)
+
+if [[ -n "$BACKUP_DIR" ]]; then
+    OLD_DB_CANDIDATES+=(
+        "$BACKUP_DIR/.nexyra-p2p/panel.sqlite"
+        "$BACKUP_DIR/nexyra-p2p/panel.sqlite"
+    )
 fi
 
-mv "$PUBLISH_DIR" "$INSTALL_DIR"
+if [[ ! -s "$TARGET_DB" ]]; then
+    for CANDIDATE in "${OLD_DB_CANDIDATES[@]}"; do
+        if [[ -s "$CANDIDATE" && "$CANDIDATE" != "$TARGET_DB" ]]; then
+            cp -a "$CANDIDATE" "$TARGET_DB"
+            for SUFFIX in -wal -shm -journal; do
+                [[ ! -f "${CANDIDATE}${SUFFIX}" ]] ||
+                    cp -a "${CANDIDATE}${SUFFIX}" "${TARGET_DB}${SUFFIX}"
+            done
+            info "Banco SQLite anterior copiado para o caminho padrao."
+            break
+        fi
+    done
+fi
 
-# PHP precisa conseguir ler o site e escrever no banco SQLite.
-# A permissao de escrita no diretorio e importante para arquivos WAL.
-chown -R www-data:www-data "$INSTALL_DIR"
-find "$INSTALL_DIR" -type d -exec chmod 755 {} \;
-find "$INSTALL_DIR" -type f -exec chmod 644 {} \;
+# Corrige somente o caminho SQLite conhecido neste projeto.
+# Se a constante estiver em outra forma, nao a sobrescreve as cegas.
+CONFIG_PHP="$PUBLISH_DIR/config/config.php"
+if [[ -f "$CONFIG_PHP" ]]; then
+    if grep -Fq "'/../.nexyra-p2p/panel.sqlite'" "$CONFIG_PHP" ||
+       grep -Fq '"/../.nexyra-p2p/panel.sqlite"' "$CONFIG_PHP" ||
+       grep -Fq "'/var/www/.nexyra-p2p/panel.sqlite'" "$CONFIG_PHP"; then
+        cp -a "$CONFIG_PHP" "$CONFIG_PHP.backup-installer"
+        python3 - "$CONFIG_PHP" <<'PY'
+from pathlib import Path
+import sys
 
-# Confirmar que o banco e as extensoes estao disponiveis.
-echo
-info "Bancos SQLite encontrados no site publicado:"
-
-find "$INSTALL_DIR" -type f \
-    \( -iname "*.sqlite" -o -iname "*.sqlite3" -o -iname "*.db" \) \
-    -print || true
-
-# ----------------------------------------------------------
-# CONFIGURAR LOG DE ERROS PHP
-# ----------------------------------------------------------
-
-PHP_LOG="/var/log/php-errors.log"
-
-touch "$PHP_LOG"
-chown www-data:adm "$PHP_LOG" 2>/dev/null || chown www-data:www-data "$PHP_LOG"
-chmod 640 "$PHP_LOG"
-
-FPM_PHP_INI="/etc/php/${PHP_VERSION}/fpm/php.ini"
-
-if [[ -f "$FPM_PHP_INI" ]]; then
-    # Habilita o log sem expor erros PHP aos visitantes.
-    sed -i \
-        -e 's/^[;[:space:]]*log_errors[[:space:]]*=.*/log_errors = On/' \
-        -e 's/^[;[:space:]]*display_errors[[:space:]]*=.*/display_errors = Off/' \
-        -e 's/^[;[:space:]]*display_startup_errors[[:space:]]*=.*/display_startup_errors = Off/' \
-        "$FPM_PHP_INI"
-
-    if ! grep -Eq '^[[:space:]]*error_log[[:space:]]*=' "$FPM_PHP_INI"; then
-        printf '\nerror_log = %s\n' "$PHP_LOG" >> "$FPM_PHP_INI"
-    else
-        sed -i \
-            "s|^[;[:space:]]*error_log[[:space:]]*=.*|error_log = $PHP_LOG|" \
-            "$FPM_PHP_INI"
+p = Path(sys.argv[1])
+s = p.read_text()
+s = s.replace(
+    "'/../.nexyra-p2p/panel.sqlite'",
+    " __DIR__ . '/../.nexyra-p2p/panel.sqlite'"
+)
+s = s.replace(
+    '"/../.nexyra-p2p/panel.sqlite"',
+    " __DIR__ . '/../.nexyra-p2p/panel.sqlite'"
+)
+s = s.replace(
+    "'/var/www/.nexyra-p2p/panel.sqlite'",
+    " __DIR__ . '/../.nexyra-p2p/panel.sqlite'"
+)
+p.write_text(s)
+PY
     fi
 fi
 
 # ----------------------------------------------------------
-# CONFIGURAR VIRTUAL HOST NGINX
+# 7. PUBLICAR SEM DEIXAR O SITE ANTIGO SEM BACKUP
 # ----------------------------------------------------------
 
-cat > "$NGINX_SITE" <<NGINX_SITE_CONF
+if [[ -d "$INSTALL_DIR" ]]; then
+    OLD_SITE="${INSTALL_DIR}.anterior-$(date +%Y%m%d-%H%M%S)"
+    mv "$INSTALL_DIR" "$OLD_SITE"
+    info "Site anterior mantido em: $OLD_SITE"
+fi
+
+mv "$PUBLISH_DIR" "$INSTALL_DIR"
+ok "Site publicado em $INSTALL_DIR"
+
+# ----------------------------------------------------------
+# 8. PERMISSOES SEGURAS
+# ----------------------------------------------------------
+
+# Código legível pelo PHP/Nginx, mas não gravável pelo processo web.
+chown -R root:www-data "$INSTALL_DIR"
+find "$INSTALL_DIR" -type d -exec chmod 750 {} \;
+find "$INSTALL_DIR" -type f -exec chmod 640 {} \;
+
+# Scripts shell permanecem executáveis se forem usados manualmente.
+find "$INSTALL_DIR" -type f -name '*.sh' -exec chmod 750 {} \;
+
+# Diretórios de dados conhecidos: PHP precisa escrever neles.
+for RELDIR in \
+    data uploads lab-downloads \
+    .nexyra-p2p nexyra-p2p \
+    nexyra/gerador/generated
+do
+    DIR="$INSTALL_DIR/$RELDIR"
+    if [[ -d "$DIR" ]]; then
+        chown -R www-data:www-data "$DIR"
+        find "$DIR" -type d -exec chmod 770 {} \;
+        find "$DIR" -type f -exec chmod 660 {} \;
+    fi
+done
+
+# O banco SQLite precisa ser gravável e sua pasta precisa permitir
+# criar arquivos journal/WAL/SHM.
+DB_PATH="$INSTALL_DIR/.nexyra-p2p/panel.sqlite"
+mkdir -p "$(dirname "$DB_PATH")"
+chown www-data:www-data "$(dirname "$DB_PATH")"
+chmod 770 "$(dirname "$DB_PATH")"
+
+if [[ -f "$DB_PATH" ]]; then
+    chown www-data:www-data "$DB_PATH"
+    chmod 660 "$DB_PATH"
+fi
+
+for SUFFIX in -wal -shm -journal; do
+    if [[ -f "${DB_PATH}${SUFFIX}" ]]; then
+        chown www-data:www-data "${DB_PATH}${SUFFIX}"
+        chmod 660 "${DB_PATH}${SUFFIX}"
+    fi
+done
+
+# Pastas de trabalho do gerador APK, sem modificar seus conteúdos.
+GEN_DIR="$INSTALL_DIR/nexyra/gerador"
+if [[ -d "$GEN_DIR" ]]; then
+    mkdir -p "$GEN_DIR/generated"
+    chown -R www-data:www-data "$GEN_DIR/generated"
+    chmod 770 "$GEN_DIR/generated"
+fi
+
+# ----------------------------------------------------------
+# 9. VALIDAR CAMINHO DO SQLITE NO PHP
+# ----------------------------------------------------------
+
+if [[ -f "$INSTALL_DIR/config/config.php" ]]; then
+    echo
+    info "SQLITE_PATH declarado pela aplicacao:"
+    grep -n 'SQLITE_PATH' "$INSTALL_DIR/config/config.php" || true
+fi
+
+# Confere sintaxe dos PHPs essenciais.
+for PHPFILE in \
+    "$INSTALL_DIR/index.php" \
+    "$INSTALL_DIR/config/config.php" \
+    "$INSTALL_DIR/config/db.php" \
+    "$INSTALL_DIR/apk.php"
+do
+    if [[ -f "$PHPFILE" ]]; then
+        php -l "$PHPFILE" || die "Erro de sintaxe PHP: $PHPFILE"
+    fi
+done
+
+# Testa a gravação como o mesmo usuário do PHP-FPM.
+# Usa o banco real apenas se ele já existe; caso contrário testa
+# criação de arquivo temporário na pasta do banco.
+if [[ -f "$DB_PATH" ]]; then
+    runuser -u www-data -- php -r '
+        $f=$argv[1];
+        $pdo=new PDO("sqlite:".$f);
+        $pdo->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
+        $pdo->exec("PRAGMA busy_timeout=5000");
+        $pdo->query("SELECT name FROM sqlite_master LIMIT 1");
+        echo "Banco SQLite existente pode ser aberto por www-data.\n";
+    ' "$DB_PATH" || die "www-data nao consegue abrir o banco SQLite."
+else
+    runuser -u www-data -- php -r '
+        $d=$argv[1];
+        $f=$d."/.sqlite-write-test-".bin2hex(random_bytes(4));
+        $pdo=new PDO("sqlite:".$f);
+        $pdo->exec("CREATE TABLE test(id INTEGER)");
+        $pdo=null;
+        unlink($f);
+        echo "www-data consegue criar e gravar arquivos SQLite.\n";
+    ' "$(dirname "$DB_PATH")" ||
+        die "www-data nao consegue escrever na pasta SQLite."
+fi
+
+# ----------------------------------------------------------
+# 10. LOGS PHP
+# ----------------------------------------------------------
+
+PHP_LOG="/var/log/php-errors.log"
+touch "$PHP_LOG"
+chown www-data:adm "$PHP_LOG" 2>/dev/null || chown www-data:www-data "$PHP_LOG"
+chmod 640 "$PHP_LOG"
+
+FPM_INI="/etc/php/${PHP_VERSION}/fpm/php.ini"
+if [[ -f "$FPM_INI" ]]; then
+    sed -i \
+        -e 's/^[;[:space:]]*log_errors[[:space:]]*=.*/log_errors = On/' \
+        -e 's/^[;[:space:]]*display_errors[[:space:]]*=.*/display_errors = Off/' \
+        -e 's/^[;[:space:]]*display_startup_errors[[:space:]]*=.*/display_startup_errors = Off/' \
+        "$FPM_INI"
+
+    if grep -Eq '^[;[:space:]]*error_log[[:space:]]*=' "$FPM_INI"; then
+        sed -i "s|^[;[:space:]]*error_log[[:space:]]*=.*|error_log = $PHP_LOG|" "$FPM_INI"
+    else
+        printf '\nerror_log = %s\n' "$PHP_LOG" >> "$FPM_INI"
+    fi
+fi
+
+# ----------------------------------------------------------
+# 11. CONFIGURAR NGINX
+# ----------------------------------------------------------
+
+mkdir -p /etc/nginx/sites-available /etc/nginx/sites-enabled
+
+cat > "$NGINX_SITE" <<NGINX
 server {
     listen 80;
     listen [::]:80;
-
     server_name $DOMAIN;
 
     root $INSTALL_DIR;
     index index.php index.html index.htm;
-
     charset utf-8;
     server_tokens off;
+    client_max_body_size 32M;
 
     access_log /var/log/nginx/painel-access.log;
     error_log /var/log/nginx/painel-error.log;
-
-    client_max_body_size 32M;
 
     location / {
         try_files \$uri \$uri/ /index.php?\$query_string;
     }
 
     location ~ \.php$ {
-        include snippets/fastcgi-php.conf;
+        try_files \$uri =404;
+        include fastcgi_params;
+        fastcgi_param SCRIPT_FILENAME \$document_root\$fastcgi_script_name;
         fastcgi_pass unix:$PHP_SOCKET;
     }
 
@@ -483,147 +458,96 @@ server {
         deny all;
     }
 }
-NGINX_SITE_CONF
+NGINX
 
 ln -sfn "$NGINX_SITE" "$NGINX_LINK"
-
 if [[ -L /etc/nginx/sites-enabled/default ]]; then
     rm -f /etc/nginx/sites-enabled/default
 fi
 
 systemctl enable nginx
-systemctl enable "php${PHP_VERSION}-fpm"
-
 systemctl restart "php${PHP_VERSION}-fpm"
 
-if ! nginx -t; then
-    erro "Configuracao do Nginx invalida."
-    erro "Configuracao anterior, se existente: ${NGINX_BACKUP:-nenhuma}"
-    exit 1
-fi
-
+nginx -t || die "Configuracao Nginx invalida; nao foi reiniciado."
 systemctl restart nginx
-
-sucesso "Site publicado e Nginx/PHP-FPM configurados."
+ok "Nginx e PHP-FPM iniciados."
 
 # ----------------------------------------------------------
-# 7. SSL LET'S ENCRYPT
+# 12. SSL OPCIONAL
 # ----------------------------------------------------------
 
 echo
-echo "[7/8] Verificando DNS para SSL..."
+echo "Verificando DNS para $DOMAIN..."
+PUBLIC_IP="$(curl -4 -fsS --max-time 10 https://api.ipify.org 2>/dev/null || true)"
+DOMAIN_IP="$(getent ahostsv4 "$DOMAIN" 2>/dev/null | awk '{print $1}' | sort -u | head -1 || true)"
 
-IP_PUBLICO="$(curl -4 -fsS --max-time 15 https://api.ipify.org 2>/dev/null || true)"
-
-IP_DOMINIO="$(
-    getent ahostsv4 "$DOMAIN" 2>/dev/null |
-    awk '{print $1}' |
-    sort -u |
-    head -n 1 || true
-)"
-
-if [[ -z "$IP_DOMINIO" ]]; then
-    aviso "Dominio ainda nao resolve para IPv4."
-    aviso "Configure o DNS A antes de emitir o SSL."
-elif [[ -n "$IP_PUBLICO" && "$IP_DOMINIO" != "$IP_PUBLICO" ]]; then
-    aviso "IP do dominio: $IP_DOMINIO"
-    aviso "IP publico da VPS: $IP_PUBLICO"
-    aviso "Confira o DNS antes de emitir o certificado."
+if [[ -z "$DOMAIN_IP" ]]; then
+    warn "Dominio ainda nao resolve para IPv4; SSL ignorado."
+elif [[ -n "$PUBLIC_IP" && "$DOMAIN_IP" != "$PUBLIC_IP" ]]; then
+    warn "DNS aponta para $DOMAIN_IP; IP publico da VPS e $PUBLIC_IP."
+    warn "Corrija o DNS A antes de emitir o SSL."
 else
-    echo
-    echo "Dominio encontrado no DNS."
-    echo "As portas TCP 80 e 443 precisam estar acessiveis."
-    read -r -p "E-mail para SSL (ENTER para pular): " EMAIL_SSL
-
-    if [[ -n "$EMAIL_SSL" ]]; then
-        if [[ "$EMAIL_SSL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
-            if certbot --nginx \
-                --non-interactive \
-                --agree-tos \
-                --redirect \
-                --email "$EMAIL_SSL" \
-                -d "$DOMAIN"; then
-
-                sucesso "Certificado SSL instalado."
-                systemctl enable certbot.timer 2>/dev/null || true
-                systemctl start certbot.timer 2>/dev/null || true
-
-                certbot renew --dry-run ||
-                    aviso "Teste de renovacao falhou; verifique o Certbot."
-            else
-                aviso "Nao foi possivel emitir o SSL nesta execucao."
-                aviso "Tente depois: certbot --nginx -d $DOMAIN"
-            fi
+    read -r -p "E-mail para Let's Encrypt (ENTER para pular SSL): " SSL_EMAIL
+    if [[ -n "$SSL_EMAIL" && "$SSL_EMAIL" =~ ^[^[:space:]@]+@[^[:space:]@]+\.[^[:space:]@]+$ ]]; then
+        if certbot --nginx --non-interactive --agree-tos \
+            --redirect --email "$SSL_EMAIL" -d "$DOMAIN"; then
+            systemctl enable certbot.timer 2>/dev/null || true
+            systemctl start certbot.timer 2>/dev/null || true
+            ok "SSL instalado."
         else
-            aviso "E-mail invalido. SSL ignorado."
+            warn "Certbot falhou. Tente depois: certbot --nginx -d $DOMAIN"
         fi
     else
-        aviso "SSL ignorado por escolha do usuario."
+        warn "SSL ignorado."
     fi
 fi
 
 # ----------------------------------------------------------
-# 8. VERIFICACAO FINAL
+# 13. TESTES FINAIS
 # ----------------------------------------------------------
 
 echo
-echo "[8/8] Verificacao final..."
+systemctl is-active --quiet nginx || die "Nginx nao esta ativo."
+systemctl is-active --quiet "php${PHP_VERSION}-fpm" || die "PHP-FPM nao esta ativo."
 
-systemctl is-active --quiet nginx &&
-    sucesso "Nginx ativo." ||
-    aviso "Nginx nao esta ativo."
+echo "===== DOMINIO GRAVADO ====="
+cat "$INSTALL_DIR/dominio.txt"
 
-systemctl is-active --quiet "php${PHP_VERSION}-fpm" &&
-    sucesso "PHP-FPM ativo." ||
-    aviso "PHP-FPM nao esta ativo."
+echo
+echo "===== EXTENSOES SQLITE ====="
+php -r 'print_r(PDO::getAvailableDrivers());'
 
-if php -r '
-    $pdo = new PDO("sqlite::memory:");
-    $pdo->query("SELECT 1");
-    echo "SQLite OK\n";
-'; then
-    sucesso "SQLite validado no PHP CLI."
-else
-    aviso "Falha no teste SQLite."
-fi
+echo
+echo "===== ESTADO DOS SERVICOS ====="
+systemctl --no-pager --full status nginx | head -8
+systemctl --no-pager --full status "php${PHP_VERSION}-fpm" | head -8
 
-nginx -t
+echo
+echo "===== HTTP LOCAL ====="
+curl -sS -o /dev/null -w 'HTTP %{http_code}\n' \
+    -H "Host: $DOMAIN" http://127.0.0.1/ || true
 
 echo
 echo "=========================================================="
-echo "             INSTALACAO CONCLUIDA"
+echo "INSTALACAO CONCLUIDA"
 echo "=========================================================="
+echo "Dominio:       $DOMAIN"
+echo "Site:          $INSTALL_DIR"
+echo "dominio.txt:   $INSTALL_DIR/dominio.txt"
+echo "PHP:           $PHP_VERSION"
+echo "SQLite:        $DB_PATH"
+echo "Log PHP:       $PHP_LOG"
+echo "Log Nginx:     /var/log/nginx/painel-error.log"
+echo "ZIP preservado: $ZIP_FILE"
+[[ -z "$BACKUP_DIR" ]] || echo "Backup:        $BACKUP_DIR"
+[[ -z "$OLD_SITE" ]] || echo "Site anterior: $OLD_SITE"
+[[ -z "$NGINX_BACKUP" ]] || echo "Backup Nginx:  $NGINX_BACKUP"
 echo
-echo "Dominio:          $DOMAIN"
-echo "Diretorio:        $INSTALL_DIR"
-echo "ZIP reutilizavel: $ZIP_FILE"
-echo "PHP:              $PHP_VERSION"
-echo "Socket PHP-FPM:   $PHP_SOCKET"
-echo "Log PHP:          $PHP_LOG"
-echo "Log Nginx:        /var/log/nginx/painel-error.log"
-echo
-echo "HTTP:  http://$DOMAIN"
-echo "HTTPS: https://$DOMAIN (se SSL instalado)"
-echo
-
-if [[ -n "$BACKUP_DIR" ]]; then
-    echo "Backup do site anterior:"
-    echo "$BACKUP_DIR"
-    echo
-fi
-
-if [[ -n "$NGINX_BACKUP" ]]; then
-    echo "Backup da configuracao anterior:"
-    echo "$NGINX_BACKUP"
-    echo
-fi
-
-echo "Para ver erros PHP:"
-echo "tail -f /var/log/php-errors.log"
-echo
-echo "Para ver erros Nginx:"
-echo "tail -f /var/log/nginx/painel-error.log"
-echo
-echo "Para executar novamente:"
-echo "bash instalar.sh"
+echo "Se houver erro:"
+echo "tail -n 100 /var/log/nginx/painel-error.log"
+echo "tail -n 100 /var/log/php-errors.log"
 echo "=========================================================="
+INSTALLER
+
+chmod 700 /root/instalar-painel.sh
+bash -n /root/instalar-painel.sh && echo "Instalador validado: sintaxe Bash OK."
