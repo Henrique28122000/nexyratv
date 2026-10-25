@@ -9,7 +9,7 @@ set -Eeuo pipefail
 # ==========================================================
 
 # ALTERE PARA O LINK DIRETO DO SEU ARQUIVO ZIP
-ZIP_URL="https://SEU-DOMINIO.com/site.zip"
+ZIP_URL="https://www.dropbox.com/scl/fi/6b7b0iyky4bffle14xo49/script_completo.zip?rlkey=2t3a3c9z41xz2138ru1pjipjy&st=a1melg5s&dl=1"
 
 INSTALL_DIR="/var/www/painel"
 TMP_DIR="/tmp/instalador-site"
