@@ -192,6 +192,33 @@ EOF
 
     nginx -t
     systemctl reload nginx
+
+    # ==========================================================
+    # INJEÇÃO DO .HTACCESS PARA A API (SEM .PHP)
+    # ==========================================================
+    echo "[api] Criando regra de roteamento limpo (.htaccess) para a API..."
+    local API_DIR="$INSTALL_DIR/api"
+    if [[ -d "$API_DIR" ]]; then
+        cat > "$API_DIR/.htaccess" <<'HTACCESS'
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /api/
+    
+    # Se o arquivo .php existir, reescreve internamente
+    RewriteCond %{REQUEST_FILENAME}.php -f
+    RewriteRule ^(.*)$ $1.php [L,QSA]
+
+    # Opcional: Redireciona 301 se o usuário digitar o .php na URL
+    RewriteCond %{THE_REQUEST} \s/+(.+?)\.php[\s?] [NC]
+    RewriteRule ^ /%1 [R=301,L]
+</IfModule>
+HTACCESS
+        chown root:www-data "$API_DIR/.htaccess"
+        chmod 640 "$API_DIR/.htaccess"
+        echo "Regra da API aplicada com sucesso."
+    else
+        echo "AVISO: pasta $API_DIR não encontrada. Pulando regra da API."
+    fi
 }
 
 # ----------------------------------------------------------
@@ -582,7 +609,7 @@ echo "[6/9] Configurando SQLite e permissoes base..."
 configure_sqlite_and_permissions
 
 # ----------------------------------------------------------
-# 7. Nginx + PHP-FPM
+# 7. Nginx + PHP-FPM + Regra da API (.htaccess)
 # ----------------------------------------------------------
 echo
 echo "[7/9] Configurando Nginx e PHP-FPM..."
@@ -628,25 +655,4 @@ if [[ -n "$EMAIL" && -n "$PUBLIC_IP" && "$DOMAIN_IP" == "$PUBLIC_IP" ]]; then
 else
     echo "SSL nao emitido automaticamente."
     echo "Verifique o DNS A de $DOMAIN para o IP $PUBLIC_IP."
-    echo "Quando estiver correto, execute: certbot --nginx -d $DOMAIN"
-fi
-
-# ----------------------------------------------------------
-# RESUMO FINAL
-# ----------------------------------------------------------
-echo
-echo "================================================"
-echo "           INSTALACAO CONCLUIDA"
-echo "================================================"
-echo "Dominio:     $DOMAIN"
-echo "Diretorio:   $INSTALL_DIR"
-echo "PHP:         $(php -r 'echo PHP_VERSION;')"
-echo "PDO:         $(php -r 'echo implode(", ", PDO::getAvailableDrivers());')"
-echo "Nginx:       $(systemctl is-active nginx)"
-PHP_VERSION="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
-echo "PHP-FPM:     $(systemctl is-active "php${PHP_VERSION}-fpm")"
-[[ -n "$BACKUP_DIR" ]] && echo "Backup:      $BACKUP_DIR"
-echo "Log do build: $LOG"
-echo
-echo "Acesse: http://$DOMAIN"
-echo "================================================"
+    echo "Quando estiver correto, execute: certbo
